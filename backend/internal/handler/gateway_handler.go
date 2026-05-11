@@ -1048,6 +1048,27 @@ func (h *GatewayHandler) Usage(c *gin.Context) {
 	h.usageUnrestricted(c, ctx, apiKey, subject, usageData, modelStats)
 }
 
+// ModelQuotas handles GET /v1/model-quotas — returns per-model aggregate quota estimates
+// for the current API key's group. Billing enforcement is skipped (like /v1/usage) so
+// quota-exhausted keys can still inspect their remaining quota.
+func (h *GatewayHandler) ModelQuotas(c *gin.Context) {
+	apiKey, _ := middleware2.GetAPIKeyFromContext(c)
+
+	var groupID *int64
+	var platform string
+
+	if apiKey != nil && apiKey.Group != nil {
+		groupID = &apiKey.Group.ID
+		platform = apiKey.Group.Platform
+	}
+	if forcedPlatform, ok := middleware2.GetForcePlatformFromContext(c); ok && strings.TrimSpace(forcedPlatform) != "" {
+		platform = forcedPlatform
+	}
+
+	resp := h.gatewayService.GetModelQuotas(c.Request.Context(), groupID, platform)
+	c.JSON(http.StatusOK, resp)
+}
+
 // parseUsageDateRange 解析 start_date / end_date query params，默认返回近 30 天范围
 func (h *GatewayHandler) parseUsageDateRange(c *gin.Context) (time.Time, time.Time) {
 	now := timezone.Now()
