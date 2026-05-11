@@ -54,6 +54,7 @@ const (
 
 	defaultUserGroupRateCacheTTL = 30 * time.Second
 	defaultModelsListCacheTTL    = 15 * time.Second
+	defaultModelQuotasCacheTTL   = 15 * time.Second
 	postUsageBillingTimeout      = 15 * time.Second
 	debugGatewayBodyEnv          = "SUB2API_DEBUG_GATEWAY_BODY"
 )
@@ -95,6 +96,9 @@ var (
 	modelsListCacheHitTotal   atomic.Int64
 	modelsListCacheMissTotal  atomic.Int64
 	modelsListCacheStoreTotal atomic.Int64
+
+	modelQuotasCacheHitTotal  atomic.Int64
+	modelQuotasCacheMissTotal atomic.Int64
 )
 
 func GatewayWindowCostPrefetchStats() (cacheHit, cacheMiss, batchSQL, fallback, errCount int64) {
@@ -115,6 +119,10 @@ func GatewayUserGroupRateCacheStats() (cacheHit, cacheMiss, load, singleflightSh
 
 func GatewayModelsListCacheStats() (cacheHit, cacheMiss, store int64) {
 	return modelsListCacheHitTotal.Load(), modelsListCacheMissTotal.Load(), modelsListCacheStoreTotal.Load()
+}
+
+func ModelQuotasCacheStats() (hit, miss int64) {
+	return modelQuotasCacheHitTotal.Load(), modelQuotasCacheMissTotal.Load()
 }
 
 func openAIStreamEventIsTerminal(data string) bool {
@@ -561,6 +569,8 @@ type GatewayService struct {
 	userGroupRateSF       singleflight.Group
 	modelsListCache       *gocache.Cache
 	modelsListCacheTTL    time.Duration
+	modelQuotasCache      *gocache.Cache
+	modelQuotasCacheTTL   time.Duration
 	settingService        *SettingService
 	responseHeaderFilter  *responseheaders.CompiledHeaderFilter
 	debugModelRouting     atomic.Bool
@@ -630,6 +640,8 @@ func NewGatewayService(
 		settingService:       settingService,
 		modelsListCache:      gocache.New(modelsListTTL, time.Minute),
 		modelsListCacheTTL:   modelsListTTL,
+		modelQuotasCache:     gocache.New(defaultModelQuotasCacheTTL, time.Minute),
+		modelQuotasCacheTTL:  defaultModelQuotasCacheTTL,
 		responseHeaderFilter: compileResponseHeaderFilter(cfg),
 		tlsFPProfileService:  tlsFPProfileService,
 		channelService:       channelService,
