@@ -13,7 +13,7 @@ import (
 )
 
 // ModelQuotaWindow represents a single quota time window for a model.
-// TotalUSD and RemainingUSD are nil when unknown_accounts_count > 0.
+// Totals are aggregated from either telemetry-derived inference or tier priors.
 type ModelQuotaWindow struct {
 	TotalUSD             *float64 `json:"total_usd"`
 	UsedUSD              float64  `json:"used_usd"`
@@ -187,36 +187,66 @@ func aggregateQuotaWindow(accountIDs []int64, accountByID map[int64]Account, sta
 		}
 		window.UsedUSD += usedUSD
 
-		usedPercentRaw, ok := acc.Extra[percentKey]
-		if !ok {
-			window.UnknownAccountsCount++
-			continue
-		}
-		usedPercent := parseExtraFloat64(usedPercentRaw)
-		if usedUSD <= 0 || usedPercent <= 0 {
-			window.UnknownAccountsCount++
-			continue
-		}
-
-		totalUSD := usedUSD / (usedPercent / 100)
-		remainingUSD := totalUSD - usedUSD
-		if remainingUSD < 0 {
-			remainingUSD = 0
-		}
+		totalUSD, remainingUSD := inferQuotaForAccount(acc, usedUSD, percentKey)
 		totalKnown += totalUSD
 		remainingKnown += remainingUSD
 	}
 
-	if window.UnknownAccountsCount > 0 {
-		window.TotalUSD = nil
-		window.RemainingUSD = nil
-		return window
-	}
 	totalKnown = math.Max(0, totalKnown)
 	remainingKnown = math.Max(0, remainingKnown)
 	window.TotalUSD = &totalKnown
 	window.RemainingUSD = &remainingKnown
 	return window
+}
+
+func inferQuotaForAccount(acc Account, usedUSD float64, percentKey string) (float64, float64) {
+	if usedPercentRaw, ok := acc.Extra[percentKey]; ok {
+		usedPercent := parseExtraFloat64(usedPercentRaw)
+		if usedUSD > 0 && usedPercent > 0 {
+			totalUSD := usedUSD / (usedPercent / 100)
+			remainingUSD := totalUSD - usedUSD
+			if remainingUSD < 0 {
+				remainingUSD = 0
+			}
+			return totalUSD, remainingUSD
+		}
+	}
+
+	priorTotal := quotaPriorForPlanType(acc.GetCredential("plan_type"))
+	return priorTotal, math.Max(priorTotal-usedUSD, 0)
+}
+
+func quotaPriorForPlanType(planType string) float64 {
+	switch normalizeQuotaPlanType(planType) {
+	case "plus":
+		return 12
+	case "team":
+		return 10
+	case "pro":
+		return 200
+	case "free":
+		return 1
+	default:
+		return 5
+	}
+}
+
+func normalizeQuotaPlanType(planType string) string {
+	lower := strings.ToLower(strings.TrimSpace(planType))
+	switch {
+	case lower == "":
+		return ""
+	case strings.Contains(lower, "team"):
+		return "team"
+	case strings.Contains(lower, "plus"):
+		return "plus"
+	case strings.Contains(lower, "pro"):
+		return "pro"
+	case strings.Contains(lower, "free"):
+		return "free"
+	default:
+		return lower
+	}
 }
 
 func cloneModelQuotaResponse(r *ModelQuotaResponse) *ModelQuotaResponse {
