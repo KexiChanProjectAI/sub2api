@@ -60,11 +60,6 @@ release:
 
     ## 📥 Installation
 
-    **Docker:**
-    ```bash
-    docker pull ghcr.io/{{ .Env.GITHUB_REPO_OWNER_LOWER }}/sub2api:{{ .Version }}
-    ```
-
     **One-line install (Linux):**
     ```bash
     curl -sSL https://raw.githubusercontent.com/{{ .Env.GITHUB_REPO_OWNER }}/{{ .Env.GITHUB_REPO_NAME }}/main/deploy/install.sh | sudo bash
