@@ -163,9 +163,11 @@ func TestGetModelQuotas_UnknownTelemetry(t *testing.T) {
 
 	r := svc.GetModelQuotas(context.Background(), nil, "openai")
 	q := r.Data[0].FiveHour
-	require.Nil(t, q.TotalUSD)
-	require.Nil(t, q.RemainingUSD)
-	require.Greater(t, q.UnknownAccountsCount, 0)
+	require.NotNil(t, q.TotalUSD)
+	require.NotNil(t, q.RemainingUSD)
+	require.InDelta(t, 5.0, *q.TotalUSD, 0.0001)
+	require.InDelta(t, 0.0, *q.RemainingUSD, 0.0001)
+	require.Equal(t, 0, q.UnknownAccountsCount)
 }
 
 func TestGetModelQuotas_ZeroPercentClamp(t *testing.T) {
@@ -180,9 +182,11 @@ func TestGetModelQuotas_ZeroPercentClamp(t *testing.T) {
 
 	r := svc.GetModelQuotas(context.Background(), nil, "openai")
 	q := r.Data[0].FiveHour
-	require.Nil(t, q.TotalUSD)
-	require.Nil(t, q.RemainingUSD)
-	require.Equal(t, 1, q.UnknownAccountsCount)
+	require.NotNil(t, q.TotalUSD)
+	require.NotNil(t, q.RemainingUSD)
+	require.InDelta(t, 5.0, *q.TotalUSD, 0.0001)
+	require.InDelta(t, 0.0, *q.RemainingUSD, 0.0001)
+	require.Equal(t, 0, q.UnknownAccountsCount)
 }
 
 func TestGetModelQuotas_NegativeRemainingClamp(t *testing.T) {
