@@ -11,7 +11,8 @@ builds:
     dir: backend
     main: ./cmd/server
     binary: sub2api
-    flags: []
+    flags:
+      - -tags=embed
     env:
       - CGO_ENABLED=0
     goos:
@@ -71,10 +72,6 @@ release:
 
     **Manual download:**
     Download the appropriate archive for your platform from the assets below.
-
-    ## ⚙️ Build Notes
-
-    This binary is built **without embedded frontend**. To use the web UI, either build with `-tags=embed` after running `pnpm build` in the `frontend/` directory, or use the Docker image which includes the frontend.
 
     ## 📚 Documentation
 
