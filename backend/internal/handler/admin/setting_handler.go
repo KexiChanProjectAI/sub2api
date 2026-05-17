@@ -527,7 +527,8 @@ type UpdateSettingsRequest struct {
 	PaymentVisibleMethodWxpayEnabled  *bool   `json:"payment_visible_method_wxpay_enabled"`
 
 	// OpenAI account scheduling
-	OpenAIAdvancedSchedulerEnabled *bool `json:"openai_advanced_scheduler_enabled"`
+	OpenAIAdvancedSchedulerEnabled  *bool `json:"openai_advanced_scheduler_enabled"`
+	OpenAIPotentialSchedulerEnabled *bool `json:"openai_potential_scheduler_enabled"`
 
 	// Balance low notification
 	BalanceLowNotifyEnabled     *bool                   `json:"balance_low_notify_enabled"`
@@ -2189,6 +2190,9 @@ func diffSettings(before *service.SystemSettings, after *service.SystemSettings,
 	}
 	if before.OpenAIAdvancedSchedulerEnabled != after.OpenAIAdvancedSchedulerEnabled {
 		changed = append(changed, "openai_advanced_scheduler_enabled")
+	}
+	if before.OpenAIPotentialSchedulerEnabled != after.OpenAIPotentialSchedulerEnabled {
+		changed = append(changed, "openai_potential_scheduler_enabled")
 	}
 	// Balance & quota notification
 	if before.BalanceLowNotifyEnabled != after.BalanceLowNotifyEnabled {
