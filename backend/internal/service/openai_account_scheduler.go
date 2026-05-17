@@ -22,11 +22,14 @@ const (
 	openAIAccountScheduleLayerSessionSticky    = "session_hash"
 	openAIAccountScheduleLayerLoadBalance      = "load_balance"
 	openAIAdvancedSchedulerSettingKey          = "openai_advanced_scheduler_enabled"
+	openAIPotentialSchedulerSettingKey        = "openai_potential_scheduler_enabled"
 )
 
 const (
 	openAIAdvancedSchedulerSettingCacheTTL  = 5 * time.Second
 	openAIAdvancedSchedulerSettingDBTimeout = 2 * time.Second
+	openAIPotentialSchedulerSettingCacheTTL = 5 * time.Second
+	openAIPotentialSchedulerSettingDBTimeout = 2 * time.Second
 )
 
 type cachedOpenAIAdvancedSchedulerSetting struct {
@@ -34,8 +37,15 @@ type cachedOpenAIAdvancedSchedulerSetting struct {
 	expiresAt int64
 }
 
+type cachedOpenAIPotentialSchedulerSetting struct {
+	enabled   bool
+	expiresAt int64
+}
+
 var openAIAdvancedSchedulerSettingCache atomic.Value // *cachedOpenAIAdvancedSchedulerSetting
 var openAIAdvancedSchedulerSettingSF singleflight.Group
+var openAIPotentialSchedulerSettingCache atomic.Value // *cachedOpenAIPotentialSchedulerSetting
+var openAIPotentialSchedulerSettingSF singleflight.Group
 
 type OpenAIAccountScheduleRequest struct {
 	GroupID                 *int64
@@ -50,15 +60,17 @@ type OpenAIAccountScheduleRequest struct {
 }
 
 type OpenAIAccountScheduleDecision struct {
-	Layer               string
-	StickyPreviousHit   bool
-	StickySessionHit    bool
-	CandidateCount      int
-	TopK                int
-	LatencyMs           int64
-	LoadSkew            float64
-	SelectedAccountID   int64
-	SelectedAccountType string
+	Layer                   string
+	StickyPreviousHit       bool
+	StickySessionHit        bool
+	CandidateCount          int
+	TopK                    int
+	LatencyMs               int64
+	LoadSkew                float64
+	SelectedAccountID       int64
+	SelectedAccountType     string
+	Strategy                string
+	PotentialFallbackReason string
 }
 
 type OpenAIAccountSchedulerMetricsSnapshot struct {
@@ -73,6 +85,8 @@ type OpenAIAccountSchedulerMetricsSnapshot struct {
 	AccountSwitchRate        float64
 	LoadSkewAvg              float64
 	RuntimeStatsAccountCount int
+	PotentialSelectTotal     int64
+	PotentialFallbackTotal   int64
 }
 
 type OpenAIAccountScheduler interface {
@@ -90,6 +104,8 @@ type openAIAccountSchedulerMetrics struct {
 	accountSwitchTotal     atomic.Int64
 	latencyMsTotal         atomic.Int64
 	loadSkewMilliTotal     atomic.Int64
+	potentialSelectTotal   atomic.Int64
+	potentialFallbackTotal atomic.Int64
 }
 
 func (m *openAIAccountSchedulerMetrics) recordSelect(decision OpenAIAccountScheduleDecision) {
@@ -107,6 +123,12 @@ func (m *openAIAccountSchedulerMetrics) recordSelect(decision OpenAIAccountSched
 	}
 	if decision.Layer == openAIAccountScheduleLayerLoadBalance {
 		m.loadBalanceSelectTotal.Add(1)
+	}
+	if decision.Strategy == "potential" {
+		m.potentialSelectTotal.Add(1)
+	}
+	if decision.Strategy == "potential" && decision.PotentialFallbackReason != "" {
+		m.potentialFallbackTotal.Add(1)
 	}
 }
 
@@ -296,11 +318,13 @@ func (s *defaultOpenAIAccountScheduler) Select(
 		return selection, decision, nil
 	}
 
-	selection, candidateCount, topK, loadSkew, err := s.selectByLoadBalance(ctx, req)
+	selection, candidateCount, topK, loadSkew, strategy, potentialFallbackReason, err := s.selectByLoadBalance(ctx, req)
 	decision.Layer = openAIAccountScheduleLayerLoadBalance
 	decision.CandidateCount = candidateCount
 	decision.TopK = topK
 	decision.LoadSkew = loadSkew
+	decision.Strategy = strategy
+	decision.PotentialFallbackReason = potentialFallbackReason
 	if err != nil {
 		return nil, decision, err
 	}
@@ -589,13 +613,13 @@ func buildOpenAIWeightedSelectionOrder(
 func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
-) (*AccountSelectionResult, int, int, float64, error) {
+) (*AccountSelectionResult, int, int, float64, string, string, error) {
 	accounts, err := s.service.listSchedulableAccounts(ctx, req.GroupID)
 	if err != nil {
-		return nil, 0, 0, 0, err
+		return nil, 0, 0, 0, "", "", err
 	}
 	if len(accounts) == 0 {
-		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, false)
+		return nil, 0, 0, 0, "", "", noAvailableOpenAISelectionError(req.RequestedModel, false)
 	}
 
 	// require_privacy_set: 获取分组信息
@@ -635,7 +659,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		})
 	}
 	if len(filtered) == 0 {
-		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, false)
+		return nil, 0, 0, 0, "", "", noAvailableOpenAISelectionError(req.RequestedModel, false)
 	}
 
 	loadMap := map[int64]*AccountLoadInfo{}
@@ -675,7 +699,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 			candidates = append(candidates, candidate)
 		}
 		if len(candidates) == 0 && len(staleSnapshotCompactRetry) == 0 {
-			return nil, 0, 0, 0, ErrNoAvailableCompactAccounts
+			return nil, 0, 0, 0, "", "", ErrNoAvailableCompactAccounts
 		}
 	}
 
@@ -737,6 +761,74 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 				weights.Queue*queueFactor +
 				weights.ErrorRate*errorFactor +
 				weights.TTFT*ttftFactor
+		}
+	}
+
+	var potentialFallbackReason string
+	var usePotentialStrategy bool
+	if s.service.isOpenAIAdvancedSchedulerEnabled(ctx) && s.service.isOpenAIPotentialSchedulerEnabled(ctx) && len(candidates) > 0 {
+		snapshots := make([]AccountPotentialSnapshot, len(candidates))
+		idToIdx := make(map[int64]int, len(candidates))
+		for i, c := range candidates {
+			snapshots[i] = buildPotentialSnapshot(c.account, c.loadInfo)
+			idToIdx[snapshots[i].AccountID] = i
+		}
+		params := DefaultPotentialParameters()
+		results := RankByPotential(snapshots, params, 1.0)
+		if results != nil && len(results) == len(candidates) {
+			allValid := true
+			for _, r := range results {
+				if !r.Valid {
+					allValid = false
+					break
+				}
+			}
+			if allValid {
+				reordered := make([]openAIAccountCandidateScore, len(candidates))
+				for i := range results {
+					snap := snapshots[i]
+					origIdx := idToIdx[snap.AccountID]
+					reordered[i] = candidates[origIdx]
+				}
+				candidates = reordered
+				usePotentialStrategy = true
+			} else {
+				potentialFallbackReason = results[0].FallbackReason
+			}
+		} else {
+			potentialFallbackReason = "potential_ranking_failed"
+		}
+		if usePotentialStrategy {
+			invalidCount := 0
+			for _, r := range results {
+				if !r.Valid {
+					invalidCount++
+				}
+			}
+			slog.Info("openai_account_scheduler potential_strategy",
+				"strategy", "potential",
+				"candidateCount", len(candidates),
+				"invalidCount", invalidCount,
+			)
+		} else if potentialFallbackReason != "" {
+			invalidCount := 0
+			unknownCount := 0
+			for _, r := range results {
+				if !r.Valid {
+					if r.FallbackReason == "unknown_account_state" {
+						unknownCount++
+					} else {
+						invalidCount++
+					}
+				}
+			}
+			slog.Info("openai_account_scheduler potential_strategy",
+				"strategy", "potential",
+				"candidateCount", len(candidates),
+				"fallbackReason", potentialFallbackReason,
+				"invalidCount", invalidCount,
+				"unknownCount", unknownCount,
+			)
 		}
 	}
 
@@ -805,7 +897,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 			}
 		}
 		if len(supported) == 0 && len(unknown) == 0 && s.service.schedulerSnapshot == nil {
-			return nil, candidateCount, topK, loadSkew, ErrNoAvailableCompactAccounts
+			return nil, candidateCount, topK, loadSkew, "legacy", "", ErrNoAvailableCompactAccounts
 		}
 		selectionOrder = append(selectionOrder, buildSelectionOrder(supported)...)
 		selectionOrder = append(selectionOrder, buildSelectionOrder(unknown)...)
@@ -816,7 +908,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		selectionOrder = buildSelectionOrder(candidates)
 	}
 	if len(selectionOrder) == 0 {
-		return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, req.RequireCompact && len(allCandidates) > 0)
+		return nil, candidateCount, topK, loadSkew, "legacy", "", noAvailableOpenAISelectionError(req.RequestedModel, req.RequireCompact && len(allCandidates) > 0)
 	}
 
 	compactBlocked := false
@@ -836,17 +928,25 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		}
 		result, acquireErr := s.service.tryAcquireAccountSlot(ctx, fresh.ID, fresh.Concurrency)
 		if acquireErr != nil {
-			return nil, candidateCount, topK, loadSkew, acquireErr
+			strategy := "legacy"
+			if usePotentialStrategy {
+				strategy = "potential"
+			}
+			return nil, candidateCount, topK, loadSkew, strategy, potentialFallbackReason, acquireErr
 		}
 		if result != nil && result.Acquired {
 			if req.SessionHash != "" {
 				_ = s.service.BindStickySession(ctx, req.GroupID, req.SessionHash, fresh.ID)
 			}
+			strategy := "legacy"
+			if usePotentialStrategy {
+				strategy = "potential"
+			}
 			return &AccountSelectionResult{
 				Account:     fresh,
 				Acquired:    true,
 				ReleaseFunc: result.ReleaseFunc,
-			}, candidateCount, topK, loadSkew, nil
+			}, candidateCount, topK, loadSkew, strategy, potentialFallbackReason, nil
 		}
 	}
 
@@ -865,6 +965,10 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 			compactBlocked = true
 			continue
 		}
+		strategy := "legacy"
+		if usePotentialStrategy {
+			strategy = "potential"
+		}
 		return &AccountSelectionResult{
 			Account: fresh,
 			WaitPlan: &AccountWaitPlan{
@@ -873,10 +977,10 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 				Timeout:        cfg.FallbackWaitTimeout,
 				MaxWaiting:     cfg.FallbackMaxWaiting,
 			},
-		}, candidateCount, topK, loadSkew, nil
+		}, candidateCount, topK, loadSkew, strategy, potentialFallbackReason, nil
 	}
 
-	return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked)
+	return nil, candidateCount, topK, loadSkew, "legacy", "", noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked)
 }
 
 func (s *defaultOpenAIAccountScheduler) isAccountTransportCompatible(account *Account, requiredTransport OpenAIUpstreamTransport) bool {
@@ -938,6 +1042,8 @@ func (s *defaultOpenAIAccountScheduler) SnapshotMetrics() OpenAIAccountScheduler
 		AccountSwitchTotal:       switchTotal,
 		SchedulerLatencyMsTotal:  latencyTotal,
 		RuntimeStatsAccountCount: s.stats.size(),
+		PotentialSelectTotal:     s.metrics.potentialSelectTotal.Load(),
+		PotentialFallbackTotal:   s.metrics.potentialFallbackTotal.Load(),
 	}
 	if selectTotal > 0 {
 		snapshot.SchedulerLatencyMsAvg = float64(latencyTotal) / float64(selectTotal)
@@ -991,6 +1097,53 @@ func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerEnabled(ctx context.Cont
 	return enabled
 }
 
+func (s *OpenAIGatewayService) openAIPotentialSchedulerSettingRepo() SettingRepository {
+	if s == nil || s.rateLimitService == nil || s.rateLimitService.settingService == nil {
+		return nil
+	}
+	return s.rateLimitService.settingService.settingRepo
+}
+
+func (s *OpenAIGatewayService) isOpenAIPotentialSchedulerEnabled(ctx context.Context) bool {
+	if cached, ok := openAIPotentialSchedulerSettingCache.Load().(*cachedOpenAIPotentialSchedulerSetting); ok && cached != nil {
+		if time.Now().UnixNano() < cached.expiresAt {
+			return cached.enabled
+		}
+	}
+
+	result, _, _ := openAIPotentialSchedulerSettingSF.Do(openAIPotentialSchedulerSettingKey, func() (any, error) {
+		if cached, ok := openAIPotentialSchedulerSettingCache.Load().(*cachedOpenAIPotentialSchedulerSetting); ok && cached != nil {
+			if time.Now().UnixNano() < cached.expiresAt {
+				return cached.enabled, nil
+			}
+		}
+
+		enabled := false
+		if repo := s.openAIPotentialSchedulerSettingRepo(); repo != nil {
+			dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openAIPotentialSchedulerSettingDBTimeout)
+			defer cancel()
+
+			value, err := repo.GetValue(dbCtx, openAIPotentialSchedulerSettingKey)
+			if err == nil {
+				enabled = strings.EqualFold(strings.TrimSpace(value), "true")
+			}
+		}
+
+		openAIPotentialSchedulerSettingCache.Store(&cachedOpenAIPotentialSchedulerSetting{
+			enabled:   enabled,
+			expiresAt: time.Now().Add(openAIPotentialSchedulerSettingCacheTTL).UnixNano(),
+		})
+		return enabled, nil
+	})
+
+	enabled, _ := result.(bool)
+	return enabled
+}
+
+func buildPotentialSnapshot(account *Account, loadInfo *AccountLoadInfo) AccountPotentialSnapshot {
+	return BuildAdvisoryQuotaSnapshot(account, loadInfo)
+}
+
 func (s *OpenAIGatewayService) getOpenAIAccountScheduler(ctx context.Context) OpenAIAccountScheduler {
 	if s == nil {
 		return nil
@@ -1012,6 +1165,11 @@ func (s *OpenAIGatewayService) getOpenAIAccountScheduler(ctx context.Context) Op
 func resetOpenAIAdvancedSchedulerSettingCacheForTest() {
 	openAIAdvancedSchedulerSettingCache = atomic.Value{}
 	openAIAdvancedSchedulerSettingSF = singleflight.Group{}
+}
+
+func resetOpenAIPotentialSchedulerSettingCacheForTest() {
+	openAIPotentialSchedulerSettingCache = atomic.Value{}
+	openAIPotentialSchedulerSettingSF = singleflight.Group{}
 }
 
 func (s *OpenAIGatewayService) SelectAccountWithScheduler(
